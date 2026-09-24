@@ -1,0 +1,114 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Where the AC CLI writes its own log file. Both the restore (main) and the
+  # store (post) phase append here, so this is the one place that has both.
+  AC_LOG_DIR: ${{ github.workspace }}/ac-logs
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # nowinandroid builds on JDK 21 (matching its own upstream CI), which also
+      # satisfies the Artifact Cache CLI's JDK 21+ requirement.
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Log — before restore
+        run: |
+          echo "::group::Runner"
+          java -version 2>&1
+          echo "GRADLE_USER_HOME=${GRADLE_USER_HOME:-<unset, CLI autodetects $HOME/.gradle>}"
+          echo "::endgroup::"
+          echo "::group::Gradle User Home before restore"
+          if [ -d "$HOME/.gradle" ]; then
+            du -sh "$HOME/.gradle" 2>/dev/null || true
+          else
+            echo "$HOME/.gradle does not exist yet (expected on a cold runner)"
+          fi
+          echo "::endgroup::"
+
+      # Restores on the main step, stores on the post step. Setup Cache only:
+      # --disable-artifact-cache turns off dependency/JDK/wrapper caching, so
+      # what moves is the Gradle User Home setup content plus the project
+      # workspace content (build/ and .gradle/), the latter discovered via the
+      # project registry the Develocity Gradle plugin writes.
+      #
+      # --verbose raises the CLI to DEBUG for both phases: restore output lands
+      # in this step, store output in "Post Develocity Setup Cache" at the very
+      # bottom of the job log.
+      - name: Develocity Setup Cache
+        uses: gradle/develocity-artifact-cache-github-action@3acc1be80162f5e988ee1c3dbed8fe22e5732ff8 # v1.0.0
+        with:
+          develocity-url: https://ge.solutions-team.gradle.com
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          additional-cli-args: |
+            --disable-artifact-cache
+            --autodetect=GRADLE
+            --verbose
+            --reporting-directory=${{ github.workspace }}/ac-logs
+
+      - name: Log — after restore
+        if: always()
+        run: |
+          echo "::group::Setup Cache content in Gradle User Home"
+          for p in caches/*/dependencies-accessors caches/*/fileHashes \
+                   caches/*/generated-gradle-jars caches/*/groovy-dsl caches/*/kotlin-dsl; do
+            for d in "$HOME"/.gradle/$p; do
+              [ -e "$d" ] && printf '%8s  %s\n' "$(du -sh "$d" 2>/dev/null | cut -f1)" "${d#"$HOME"/.gradle/}"
+            done
+          done
+          printf '%8s  %s\n' "$(du -sh "$HOME/.gradle" 2>/dev/null | cut -f1)" "TOTAL"
+          echo "::endgroup::"
+          echo "::group::Project registry (drives build/ and .gradle/ caching)"
+          # Written by the Develocity Gradle plugin; absent before the first build.
+          ls -la "$HOME"/.gradle/.develocity/artifact-cache/projects-registry-*/ 2>/dev/null \
+            || echo "no registry yet — written during the build below"
+          echo "::endgroup::"
+          echo "::group::Restored workspace content"
+          du -sh .gradle 2>/dev/null || echo "no .gradle/"
+          find . -maxdepth 3 -type d -name build -not -path './build-logic/*' 2>/dev/null \
+            | head -20 | while read -r d; do printf '%8s  %s\n' "$(du -sh "$d" | cut -f1)" "$d"; done
+          echo "::endgroup::"
+
+      - name: Build
+        run: ./gradlew :core:model:compileKotlin -Dscan.tag.sc_1
+        env:
+          # host=key form; the Develocity Gradle plugin reads this to publish
+          # Build Scans to the server configured in settings.gradle.kts.
+          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+
+      - name: Log — after build (what the post step will store)
+        if: always()
+        run: |
+          echo "::group::Project registry"
+          ls -la "$HOME"/.gradle/.develocity/artifact-cache/projects-registry-*/ 2>/dev/null \
+            || echo "no registry — workspace content will NOT be stored"
+          echo "::endgroup::"
+          echo "::group::Workspace content"
+          du -sh .gradle 2>/dev/null || echo "no .gradle/"
+          find . -maxdepth 3 -type d -name build -not -path './build-logic/*' 2>/dev/null \
+            | head -20 | while read -r d; do printf '%8s  %s\n' "$(du -sh "$d" | cut -f1)" "$d"; done
+          echo "::endgroup::"
+
+      # Keeps the restore-phase log after the job ends. The store-phase log is
+      # written by the post step, which runs after every normal step including
+      # this one, so it is not in the uploaded file — read it in the job log
+      # under "Post Develocity Setup Cache".
+      - name: Upload AC CLI log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: artifact-cache-log
+          path: ${{ env.AC_LOG_DIR }}
+          if-no-files-found: warn
+          retention-days: 7

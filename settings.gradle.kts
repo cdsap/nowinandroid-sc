@@ -29,6 +29,21 @@ pluginManagement {
     }
 }
 
+plugins {
+    id("com.gradle.develocity") version "4.5.1"
+    id("com.gradle.common-custom-user-data-gradle-plugin") version "2.2"
+}
+
+develocity {
+    server = "https://ge.solutions-team.gradle.com/"
+    buildScan {
+        // Scans must be complete before the JVM exits, otherwise short CI jobs
+        // can finish before the upload does.
+        uploadInBackground = false
+        publishing.onlyIf { true }
+    }
+}
+
 dependencyResolutionManagement {
     repositoriesMode = RepositoriesMode.FAIL_ON_PROJECT_REPOS
     repositories {

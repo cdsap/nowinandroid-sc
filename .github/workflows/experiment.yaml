@@ -1,0 +1,114 @@
+name: Experiment
+
+# Runs the same Gradle task N times (default 50), so the resulting Build Scans
+# can be compared as a population rather than a single sample. Modelled on
+# cdsap/Telltale's experiment workflow: a matrix generated from an iteration
+# count. Each iteration is independent — no seed build.
+#
+# Two variants, selected by the setup_cache input:
+#   setup_cache = true   Develocity Setup Cache restores/stores each iteration
+#   setup_cache = false  control group; no cache step at all
+#
+# Every scan is tagged:
+#   sc_2 | no_sc           — which variant produced the scan
+#   experiment             — distinguishes these from ordinary CI builds
+#   <run_number>           — identifies one batch of iterations
+#
+# Find a batch in Develocity with: tag:<sc_2|no_sc> tag:experiment tag:<run_number>
+#
+# The two variants are separate dispatches, so each gets its own run_number;
+# compare them by their respective tags, not by a shared one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Gradle task to execute"
+        required: true
+        default: ":core:model:compileKotlin"
+      iterations:
+        description: "Number of measured builds"
+        required: true
+        default: "50"
+      setup_cache:
+        description: >-
+          Run the Develocity Setup Cache step. Off gives the control group:
+          every iteration configures and builds from scratch. Also selects the
+          scan tag (sc_2 when on, no_sc when off).
+        type: boolean
+        required: true
+        default: true
+      max_parallel:
+        description: >-
+          Concurrent iterations. Lower this to reduce contention on the
+          Develocity server and on GitHub's concurrency limit.
+        required: true
+        default: "10"
+      extra_args:
+        description: "Extra Gradle arguments"
+        required: false
+        default: ""
+
+run-name: "${{ inputs.setup_cache && 'sc_2' || 'no_sc' }} · ${{ inputs.task }} · ${{ inputs.iterations }} iterations"
+
+env:
+  DEVELOCITY_URL: https://ge.solutions-team.gradle.com
+
+jobs:
+  # Turns the iteration count into a JSON array the matrix can consume,
+  # e.g. 3 -> ["1","2","3"]. GitHub has no native range expression.
+  iterations:
+    name: Generate Iterations
+    runs-on: ubuntu-latest
+    outputs:
+      iterations: ${{ steps.calculate.outputs.iterations }}
+    steps:
+      - id: calculate
+        run: |
+          n='${{ inputs.iterations }}'
+          case "$n" in
+            ''|*[!0-9]*) echo "iterations must be a positive integer, got '$n'" >&2; exit 1 ;;
+          esac
+          [ "$n" -ge 1 ] || { echo "iterations must be >= 1" >&2; exit 1; }
+          # The matrix caps at 256 jobs.
+          [ "$n" -le 256 ] || { echo "iterations must be <= 256 (GitHub matrix limit)" >&2; exit 1; }
+          list=$(jq -nc --argjson n "$n" '[range(1; $n + 1) | tostring]')
+          echo "generated $n iterations: $list"
+          echo "iterations=$list" >> "$GITHUB_OUTPUT"
+
+  experiment:
+    name: "Iteration ${{ matrix.iteration }}"
+    needs: [iterations]
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel) }}
+      matrix:
+        iteration: ${{ fromJson(needs.iterations.outputs.iterations) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Develocity Setup Cache
+        if: inputs.setup_cache
+        uses: gradle/develocity-artifact-cache-github-action@3acc1be80162f5e988ee1c3dbed8fe22e5732ff8 # v1.0.0
+        with:
+          develocity-url: ${{ env.DEVELOCITY_URL }}
+          develocity-access-key: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          additional-cli-args: |
+            --disable-artifact-cache
+            --autodetect=GRADLE
+
+      - name: Build
+        run: |
+          ./gradlew ${{ inputs.task }} ${{ inputs.extra_args }} \
+            -Dscan.tag.${{ inputs.setup_cache && 'sc_2' || 'no_sc' }} \
+            -Dscan.tag.experiment \
+            -Dscan.tag.${{ github.run_number }} \
+            -Dscan.value.iteration=${{ matrix.iteration }}
+        env:
+          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
